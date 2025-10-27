@@ -1,7 +1,8 @@
 import copy
 import yaml
 import warnings
-from typing import Any, Dict, Union, Optional, Iterable
+from dataclasses import dataclass
+from typing import Any, Dict, Union, Optional, Iterable, Mapping, Sequence
 from _repo_remote_layer_scanner import RemoteLayerScanner
 from _yaml_dumper import YamlDumper
 
@@ -45,6 +46,20 @@ def _coerce_version(version: Union[int, str]) -> int:
     return max(1, min(20, v))
 
 
+@dataclass(frozen=True)
+class _LayerPattern:
+    repo: Optional[str]
+    name: str
+
+    def matches(self, repo_id: str, layer: str) -> bool:
+        if self.repo and self.repo != repo_id:
+            return False
+        if self.name == layer:
+            return True
+        # Allow matching by basename for convenience
+        return self.name == layer.rstrip("/").split("/")[-1]
+
+
 class KASExporter:
     def __init__(
             self,
@@ -53,7 +68,10 @@ class KASExporter:
             *,
             path_prefix: Optional[str] = None,
             path_dedup: str = "off",  # "off" | "suffix"
-            path_apply_mode: str = "always"
+            path_apply_mode: str = "always",
+            include_layers: Optional[Sequence[str]] = None,
+            exclude_layers: Optional[Sequence[str]] = None,
+            layer_hints: Optional[Mapping[str, Sequence[str]]] = None,
     ):
         self.manifest_data = copy.deepcopy(manifest_data)
         self.version = _coerce_version(version)
@@ -64,6 +82,38 @@ class KASExporter:
         if path_apply_mode not in {"always", "missing-only"}:
             raise ValueError("path_apply_mode must be 'always' or 'missing-only'")
         self.path_apply_mode = path_apply_mode
+
+        def _compile_patterns(values: Optional[Sequence[str]]) -> list[_LayerPattern]:
+            patterns: list[_LayerPattern] = []
+            if not values:
+                return patterns
+            for raw in values:
+                if not raw:
+                    continue
+                repo_part: Optional[str]
+                name_part: str
+                if ":" in raw:
+                    repo_part, name_part = raw.split(":", 1)
+                    repo_part = repo_part.strip() or None
+                else:
+                    repo_part = None
+                    name_part = raw
+                name_part = name_part.strip()
+                if not name_part:
+                    continue
+                patterns.append(_LayerPattern(repo_part, name_part))
+            return patterns
+
+        self._include_patterns = _compile_patterns(include_layers)
+        self._exclude_patterns = _compile_patterns(exclude_layers)
+        self._layer_hints: dict[str, list[str]] = {}
+        if layer_hints:
+            for repo_name, hints in layer_hints.items():
+                if not repo_name:
+                    continue
+                clean = [h.strip() for h in (hints or []) if h and h.strip()]
+                if clean:
+                    self._layer_hints[repo_name] = clean
 
         # Build remote->fetch map for URL resolution
         self._remote_fetch = {
@@ -368,8 +418,10 @@ class KASExporter:
             # layers
             print("  Discovering layers...")
             layers = _discover_layers(repo_entry["url"], revision)
-            if layers is not None:
-                repo_entry["layers"] = self._normalize_layers(layers)
+            hints = self._layer_hints.get(repo_id, [])
+            normalized_layers = self._normalize_layers(repo_id, layers, hints)
+            if normalized_layers:
+                repo_entry["layers"] = normalized_layers
 
             # v8: patches
             if self.version >= 8 and proj.get("patches"):
@@ -468,20 +520,41 @@ class KASExporter:
                     branch = branch or rev
         return commit, branch, tag, refspec
 
-    @staticmethod
-    def _normalize_layers(layers: Iterable[str]) -> Dict[str, Any]:
-        seen, out = set(), []
-        for layer in layers:
+    def _normalize_layers(
+            self,
+            repo_id: str,
+            discovered_layers: Optional[Iterable[str]],
+            hints: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        seen: set[str] = set()
+        out: list[str] = []
+
+        def _consider(layer: str) -> None:
             if not layer:
-                continue
+                return
             if any(s in layer for s in _LAYER_FILTER_SUBSTRS):
-                continue
+                return
+            if not self._layer_allowed(repo_id, layer):
+                return
             if layer in seen:
-                continue
+                return
             seen.add(layer)
             out.append(layer)
+
+        for layer in (discovered_layers or []):
+            _consider(layer)
+        for layer in (hints or []):
+            _consider(layer)
+
         out.sort()
-        return {name: None for name in out}
+        return {name: None for name in out} if out else {}
+
+    def _layer_allowed(self, repo_id: str, layer: str) -> bool:
+        if any(pattern.matches(repo_id, layer) for pattern in self._exclude_patterns):
+            return False
+        if self._include_patterns:
+            return any(pattern.matches(repo_id, layer) for pattern in self._include_patterns)
+        return True
 
     @staticmethod
     def _normalize_patches(patches: Any) -> Dict[str, Any]:
