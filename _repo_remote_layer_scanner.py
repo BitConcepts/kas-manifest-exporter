@@ -3,8 +3,10 @@ import re
 import urllib.parse
 import urllib.error
 from dataclasses import dataclass, field
-from _http_client import HttpClient
+from html.parser import HTMLParser
 from typing import Dict, List, Optional
+
+from _http_client import HttpClient
 
 _CONF_TARGET = "conf/layer.conf"
 
@@ -276,8 +278,82 @@ class RemoteLayerScanner:
         visited: set[str] = set()
         stack: List[str] = [""]
 
-        re_tree_href = re.compile(r'href="(?:/[^"]+)?/tree/([^"?#]+)\?h=[^"]*"')
-        re_plain_href = re.compile(r'href="(?:/[^"]+)?/plain/([^"?#]+)\?h=[^"]*"')
+        class _CgitHrefParser(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__()
+                self.entries: List[Dict[str, Optional[str]]] = []
+                self._current: Optional[Dict[str, Optional[str]]] = None
+
+            def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
+                tag = tag.lower()
+                if tag == "tr":
+                    self._current = {"type": None, "tree": None, "plain": None}
+                    return
+
+                if self._current is None:
+                    return
+
+                if tag == "span":
+                    cls = None
+                    for k, v in attrs:
+                        if k.lower() == "class":
+                            cls = v
+                            break
+                    if not cls:
+                        return
+                    classes = {c for c in re.split(r"\s+", cls) if c}
+                    if "ls-dir" in classes:
+                        self._current["type"] = "dir"
+                    elif "ls-tree" in classes:
+                        # some cgit themes use ls-tree for directories as well
+                        self._current["type"] = "dir"
+                    elif "ls-blob" in classes:
+                        self._current["type"] = "blob"
+                    elif "ls-symlink" in classes:
+                        self._current["type"] = "blob"
+                    elif "ls-commit" in classes:
+                        self._current["type"] = "submodule"
+                    return
+
+                if tag != "a":
+                    return
+
+                href = None
+                for k, v in attrs:
+                    if k.lower() == "href":
+                        href = v
+                        break
+                if not href:
+                    return
+
+                def _extract(marker: str) -> Optional[str]:
+                    idx = href.find(marker)
+                    if idx == -1:
+                        return None
+                    path = href[idx + len(marker):]
+                    for sep in ("?", "#", ";"):
+                        if sep in path:
+                            path = path.split(sep, 1)[0]
+                    path = path.strip("/")
+                    if not path:
+                        return None
+                    return urllib.parse.unquote(path)
+
+                tree = _extract("/tree/")
+                if tree:
+                    self._current["tree"] = tree
+
+                plain = _extract("/plain/")
+                if plain:
+                    self._current["plain"] = plain
+
+            def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+                if tag.lower() != "tr":
+                    return
+                if self._current and self._current.get("tree"):
+                    self.entries.append(self._current)
+                self._current = None
+
 
         while stack:
             prefix = stack.pop()
@@ -295,37 +371,48 @@ class RemoteLayerScanner:
             except Exception:  # noqa
                 continue
 
-            tree_paths = set(re_tree_href.findall(html))
-            plain_paths = set(re_plain_href.findall(html))  # files
+            parser = _CgitHrefParser()
+            parser.feed(html)
 
-            for p in tree_paths:
-                if p.endswith(_CONF_TARGET):
-                    layer_dir = p[: -len(_CONF_TARGET)].rstrip("/")
+            entries = parser.entries
+
+            for entry in entries:
+                tree_path = entry.get("tree") or ""
+                if tree_path.endswith(_CONF_TARGET):
+                    layer_dir = tree_path[: -len(_CONF_TARGET)].rstrip("/")
                     if layer_dir:
                         layers.add(layer_dir)
 
-            for p in tree_paths:
-                if prefix and not p.startswith(prefix.rstrip("/") + "/"):
+            for entry in entries:
+                tree_path = entry.get("tree")
+                if not tree_path:
                     continue
-                if p in plain_paths:
+
+                entry_type = entry.get("type")
+                if not entry_type:
+                    # directories generally lack a plain link, blobs have one
+                    entry_type = "dir" if not entry.get("plain") else "blob"
+
+                if entry_type != "dir":
                     continue
-                if p.endswith(_CONF_TARGET):
-                    continue
-                if "/" in p and p.rsplit("/", 1)[-1].count(".") > 0:
+
+                base_prefix = prefix.rstrip("/")
+                if prefix and not tree_path.startswith(base_prefix + "/"):
                     continue
 
                 if prefix == "":
-                    if "/" not in p:
-                        stack.append(p)
+                    if "/" not in tree_path:
+                        if tree_path not in visited:
+                            stack.append(tree_path)
                     else:
-                        head = p.split("/", 1)[0]
+                        head = tree_path.split("/", 1)[0]
                         if head and head not in visited:
                             stack.append(head)
                 else:
-                    if p.startswith(prefix.rstrip("/") + "/"):
-                        tail = p[len(prefix.rstrip("/")) + 1:]
-                        if "/" not in tail:
-                            stack.append(p)
+                    tail = tree_path[len(base_prefix) + 1:]
+                    if tail and "/" not in tail:
+                        if tree_path not in visited:
+                            stack.append(tree_path)
 
         return sorted(layers)
 
