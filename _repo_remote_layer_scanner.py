@@ -350,7 +350,7 @@ class RemoteLayerScanner:
             def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
                 if tag.lower() != "tr":
                     return
-                if self._current and self._current.get("tree"):
+                if self._current and (self._current.get("tree") or self._current.get("plain")):
                     self.entries.append(self._current)
                 self._current = None
 
@@ -377,9 +377,9 @@ class RemoteLayerScanner:
             entries = parser.entries
 
             for entry in entries:
-                tree_path = entry.get("tree") or ""
-                if tree_path.endswith(_CONF_TARGET):
-                    layer_dir = tree_path[: -len(_CONF_TARGET)].rstrip("/")
+                target_path = entry.get("plain") or entry.get("tree") or ""
+                if target_path.endswith(_CONF_TARGET):
+                    layer_dir = target_path[: -len(_CONF_TARGET)].rstrip("/")
                     if layer_dir:
                         layers.add(layer_dir)
 
