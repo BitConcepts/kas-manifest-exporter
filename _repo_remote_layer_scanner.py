@@ -3,8 +3,10 @@ import re
 import urllib.parse
 import urllib.error
 from dataclasses import dataclass, field
-from _http_client import HttpClient
+from html.parser import HTMLParser
 from typing import Dict, List, Optional
+
+from _http_client import HttpClient
 
 _CONF_TARGET = "conf/layer.conf"
 
@@ -276,8 +278,44 @@ class RemoteLayerScanner:
         visited: set[str] = set()
         stack: List[str] = [""]
 
-        re_tree_href = re.compile(r'href="(?:/[^"]+)?/tree/([^"?#]+)\?h=[^"]*"')
-        re_plain_href = re.compile(r'href="(?:/[^"]+)?/plain/([^"?#]+)\?h=[^"]*"')
+        class _CgitHrefParser(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__()
+                self.tree_paths: set[str] = set()
+                self.plain_paths: set[str] = set()
+
+            def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
+                if tag.lower() != "a":
+                    return
+                href = None
+                for k, v in attrs:
+                    if k.lower() == "href":
+                        href = v
+                        break
+                if not href:
+                    return
+
+                def _extract(marker: str) -> Optional[str]:
+                    idx = href.find(marker)
+                    if idx == -1:
+                        return None
+                    path = href[idx + len(marker):]
+                    for sep in ("?", "#", ";"):
+                        if sep in path:
+                            path = path.split(sep, 1)[0]
+                    path = path.strip("/")
+                    if not path:
+                        return None
+                    return urllib.parse.unquote(path)
+
+                tree = _extract("/tree/")
+                if tree:
+                    self.tree_paths.add(tree)
+
+                plain = _extract("/plain/")
+                if plain:
+                    self.plain_paths.add(plain)
+
 
         while stack:
             prefix = stack.pop()
@@ -295,8 +333,10 @@ class RemoteLayerScanner:
             except Exception:  # noqa
                 continue
 
-            tree_paths = set(re_tree_href.findall(html))
-            plain_paths = set(re_plain_href.findall(html))  # files
+            parser = _CgitHrefParser()
+            parser.feed(html)
+            tree_paths = set(parser.tree_paths)
+            plain_paths = set(parser.plain_paths)
 
             for p in tree_paths:
                 if p.endswith(_CONF_TARGET):
