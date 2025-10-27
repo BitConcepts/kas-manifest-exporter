@@ -1,23 +1,3 @@
-# repo_manifest_loader_libgit2.py
-#
-# Load an Android "repo" manifest from a Git repo using libgit2 (pygit2).
-# - No external `git` binary required.
-# - If 'branch' is None, discovers and uses the repo's default branch.
-# - If 'manifest_filename' is None, uses "default.xml" (tries common locations).
-# - Returns manifest_data compatible with KASExporter.
-#
-# Usage:
-#   from repo_manifest_loader_libgit2 import load_manifest_from_git_libgit2
-#   from kas_exporter import KASExporter
-#
-#   md = load_manifest_from_git_libgit2(
-#       repo_url="https://github.com/nxp-imx/imx-manifests.git",
-#       branch=None,             # None -> default branch
-#       manifest_filename=None,  # None -> "default.xml" (with common fallbacks)
-#   )
-#   print(KASExporter(md, version=14).generate_kas_configuration())
-
-from __future__ import annotations
 import os
 import shutil
 import tempfile
@@ -25,9 +5,10 @@ import warnings
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 
-import pygit2
-
-from repo_manifest_parser import RepoManifestParser
+import pygit2 as git
+from pygit2.enums import ResetMode, CheckoutStrategy
+from pygit2 import Repository, Commit
+from _repo_manifest_parser import RepoManifestParser
 
 
 class LibGitError(RuntimeError):
@@ -41,7 +22,27 @@ _DEFAULT_MANIFESTS: List[str] = [
 ]
 
 
-def _discover_default_branch(repo: pygit2.Repository) -> Optional[str]:
+def _repo_key_from_path_or_name(path_or_name: str) -> str:
+    """Return a stable repo key (kas 'repos:' key) from manifest project path/name."""
+    base = os.path.basename(path_or_name.rstrip("/"))
+    return base or path_or_name
+
+
+def _maybe_add_defaults_from_env(manifest_data: dict) -> None:
+    """Allow the caller to set MACHINE/DISTRO/TARGETS via env without hardcoding."""
+    machine = os.environ.get("KAS_MACHINE")
+    distro = os.environ.get("KAS_DISTRO")
+    targets = os.environ.get("KAS_TARGETS")  # space or comma separated
+    if distro and not manifest_data.get("distro"):
+        manifest_data["distro"] = distro
+    if machine and not manifest_data.get("machine"):
+        manifest_data["machine"] = machine
+    if targets and not manifest_data.get("target"):
+        sep = "," if "," in targets else " "
+        manifest_data["target"] = [t for t in (x.strip() for x in targets.split(sep)) if t]
+
+
+def _discover_default_branch(repo: Repository) -> Optional[str]:
     """
     Best-effort default-branch detection:
       1) If HEAD is attached to a local branch, return that name.
@@ -50,7 +51,7 @@ def _discover_default_branch(repo: pygit2.Repository) -> Optional[str]:
     try:
         if not repo.head_is_unborn and not repo.head_is_detached:
             return repo.head.shorthand  # e.g., 'main' or 'scarthgap'
-    except Exception:
+    except Exception:  # noqa
         pass
 
     try:
@@ -59,13 +60,13 @@ def _discover_default_branch(repo: pygit2.Repository) -> Optional[str]:
         shorthand = origin_head.shorthand  # e.g., 'origin/main'
         if shorthand and "/" in shorthand:
             return shorthand.split("/", 1)[1]
-    except Exception:
+    except Exception:  # noqa
         pass
 
     return None
 
 
-def _checkout_branch(repo: pygit2.Repository, branch_name: str) -> None:
+def _checkout_branch(repo: Repository, branch_name: str) -> None:
     """
     Ensure a local branch exists for 'branch_name' from origin/<branch_name>,
     set HEAD to it, reset the working tree, and checkout files.
@@ -85,19 +86,16 @@ def _checkout_branch(repo: pygit2.Repository, branch_name: str) -> None:
             remote_ref = repo.lookup_reference(f"refs/remotes/origin/{branch_name}")
         except KeyError:
             raise LibGitError(f"Cannot find remote branch 'origin/{branch_name}' after fetch")
-        commit = repo.get(remote_ref.target)
-        repo.create_branch(branch_name, commit)
+        commit: Optional[Commit] = repo.get(remote_ref.target)
+        if commit:
+            repo.create_branch(branch_name, commit)
 
     repo.set_head(local_ref_name)
 
     target = repo.revparse_single(local_ref_name)
-    try:
-        repo.reset(target, pygit2.GIT_RESET_HARD)
-    except TypeError:
-        obj_id = getattr(target, "oid", None) or getattr(target, "id", None)
-        repo.reset(obj_id, pygit2.GIT_RESET_HARD)
+    repo.reset(target.id, ResetMode.HARD)
 
-    repo.checkout_head(strategy=pygit2.GIT_CHECKOUT_SAFE)
+    repo.checkout_head(strategy=CheckoutStrategy.SAFE)
 
 
 def _resolve_manifest_path(repo_root: str, manifest_filename: Optional[str]) -> str:
@@ -126,7 +124,7 @@ def _resolve_manifest_path(repo_root: str, manifest_filename: Optional[str]) -> 
     )
 
 
-def load_manifest_from_git_libgit2(
+def load_manifest_from_git(
         repo_url: str,
         branch: Optional[str] = None,
         manifest_filename: Optional[str] = None,
@@ -154,12 +152,10 @@ def load_manifest_from_git_libgit2(
     created_parent = workdir is None
     clone_dir = os.path.join(parent_dir, "repo")
 
-    repo: Optional[pygit2.Repository] = None
-
     try:
         # Clone without specifying checkout_branch so we land on provider's default branch.
         # If 'branch' is provided, we’ll check it out explicitly after cloning.
-        repo = pygit2.clone_repository(repo_url, clone_dir)
+        repo = git.clone_repository(repo_url, clone_dir)
 
         # Decide which branch to use
         active_branch = branch or _discover_default_branch(repo)  # may still be None (detached or unborn)
@@ -180,8 +176,8 @@ def load_manifest_from_git_libgit2(
 
         # Record commit
         try:
-            head_commit = repo.head.target.hex
-        except Exception:
+            head_commit = repo.revparse_single("HEAD").id.__str__()
+        except Exception:  # noqa
             head_commit = None
 
         # Locate manifest
@@ -199,7 +195,6 @@ def load_manifest_from_git_libgit2(
             "manifest_filename": os.path.relpath(manifest_path, clone_dir),
             "pulled_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "commit": head_commit,
-            "transport": "libgit2",
         }
 
         if keep_checkout:
@@ -216,12 +211,12 @@ def load_manifest_from_git_libgit2(
         if not keep_checkout:
             try:
                 shutil.rmtree(clone_dir, ignore_errors=True)
-            except Exception:
+            except Exception:  # noqa
                 pass
             if created_parent:
                 try:
                     shutil.rmtree(parent_dir, ignore_errors=True)
-                except Exception:
+                except Exception:  # noqa
                     pass
         raise LibGitError(str(e)) from e
 
@@ -231,12 +226,12 @@ def _discover_repo_root(start_dir: str) -> Optional[str]:
     Find the enclosing git repo workdir (not .git path). Returns None if not in a repo.
     """
     try:
-        git_dir = pygit2.discover_repository(start_dir)
+        git_dir = git.discover_repository(start_dir)
         if not git_dir:
             return None
-        repo = pygit2.Repository(git_dir)
-        return (repo.workdir or None)
-    except Exception:
+        repo = git.Repository(git_dir)
+        return repo.workdir or None
+    except Exception:  # noqa
         return None
 
 
@@ -248,7 +243,7 @@ def _is_within(path: str, root: str) -> bool:
         path_real = os.path.realpath(path)
         root_real = os.path.realpath(root)
         return os.path.commonpath([path_real, root_real]) == root_real
-    except Exception:
+    except Exception:  # noqa
         return False
 
 

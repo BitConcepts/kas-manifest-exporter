@@ -1,11 +1,4 @@
-# repo_manifest_parser.py
-#
-# Parse Android "repo" XML manifests (v2.59) and convert to a manifest_data
-# dict compatible with KASExporter (from prior code). Now warns if <include>
-# is encountered but manifest_dir is not provided (so the include can't be resolved).
-
-from __future__ import annotations
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, Optional, Tuple, Set
 import os
 import io
 import xml.etree.ElementTree as ET
@@ -65,7 +58,8 @@ class RepoManifestParser:
 
     # ------------------------------ INTERNALS ---------------------------------
 
-    def _empty_state(self) -> Dict[str, Any]:
+    @staticmethod
+    def _empty_state() -> Dict[str, Any]:
         return {
             "remotes": {},  # name -> { fetch, review, pushurl, alias, revision, annotations[] }
             "default": {},  # { remote, revision, dest-branch, upstream, sync-j, sync-c, sync-s, sync-tags }
@@ -116,7 +110,8 @@ class RepoManifestParser:
 
     # ------------------------------ ELEMENT HANDLERS --------------------------
 
-    def _add_remote(self, el: ET.Element, state: Dict[str, Any]) -> None:
+    @staticmethod
+    def _add_remote(el: ET.Element, state: Dict[str, Any]) -> None:
         name = el.attrib["name"]
         r = {
             "name": name,
@@ -131,7 +126,8 @@ class RepoManifestParser:
             r["annotations"].append(dict(ann.attrib))
         state["remotes"][name] = r
 
-    def _merge_default(self, el: ET.Element, state: Dict[str, Any]) -> None:
+    @staticmethod
+    def _merge_default(el: ET.Element, state: Dict[str, Any]) -> None:
         d = state["default"]
         for k in ("remote", "revision", "dest-branch", "upstream", "sync-j", "sync-c", "sync-s", "sync-tags"):
             if el.attrib.get(k) is not None:
@@ -169,7 +165,8 @@ class RepoManifestParser:
                 UserWarning,
             )
 
-    def _handle_submanifest(self, el: ET.Element, state: Dict[str, Any], manifest_dir: Optional[str]) -> None:
+    @staticmethod
+    def _handle_submanifest(el: ET.Element, state: Dict[str, Any], manifest_dir: Optional[str]) -> None:
         info = dict(el.attrib)
         state["submanifests"].append(info)
         # Keep as breadcrumb; environment-specific resolution can be added later.
@@ -206,19 +203,22 @@ class RepoManifestParser:
                 proj["subprojects"].append(subp)
         state["projects"].append(proj)
 
-    def _queue_extend(self, el: ET.Element, state: Dict[str, Any]) -> None:
+    @staticmethod
+    def _queue_extend(el: ET.Element, state: Dict[str, Any]) -> None:
         state["extend"].append(dict(el.attrib))
 
-    def _queue_remove(self, el: ET.Element, state: Dict[str, Any]) -> None:
+    @staticmethod
+    def _queue_remove(el: ET.Element, state: Dict[str, Any]) -> None:
         op = dict(el.attrib)
         b = _text_bool(op.get("optional"))
         if b is not None:
-            op["optional"] = b
+            op["optional"] = str(b)
         state["remove"].append(op)
 
     # ------------------------------ TRANSFORMS --------------------------------
 
-    def _apply_remove_project(self, state: Dict[str, Any]) -> None:
+    @staticmethod
+    def _apply_remove_project(state: Dict[str, Any]) -> None:
         if not state["remove"]:
             return
         keep = []
@@ -244,7 +244,8 @@ class RepoManifestParser:
                 keep.append(p)
         state["projects"] = keep
 
-    def _apply_extend_project(self, state: Dict[str, Any]) -> None:
+    @staticmethod
+    def _apply_extend_project(state: Dict[str, Any]) -> None:
         if not state["extend"]:
             return
         for e in state["extend"]:
@@ -296,7 +297,8 @@ class RepoManifestParser:
 
         return md
 
-    def _project_to_exporter_shape(self, p: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+    @staticmethod
+    def _project_to_exporter_shape(p: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
         out: Dict[str, Any] = {
             "name": p["name"],
             "path": p.get("path", p["name"]),

@@ -1,5 +1,8 @@
-from repo_manifest_loader import load_manifest_from_git_libgit2 as load_manifest_from_git
-from kas_exporter import KASExporter
+#!/usr/bin/env python3
+
+from _repo_manifest_loader import load_manifest_from_git as load_manifest_from_git
+from _kas_exporter import KASExporter
+
 
 md = load_manifest_from_git(
     repo_url="https://github.com/varigit/variscite-bsp-platform",

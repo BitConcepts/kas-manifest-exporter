@@ -1,25 +1,33 @@
-# kas_exporter.py
-#
-# Export a kas project configuration supporting format versions 1..20.
-# Adds:
-#   - path_prefix: prepend a directory (e.g., "sources") to each repo path.
-#   - path_dedup:  handle path collisions. Values:
-#         "off"   -> raise ValueError on first collision (default)
-#         "suffix"-> append "~1", "~2", ... to conflicting paths
-#     Emits warnings for every collision.
-# Also prepends a comment header with source metadata (git/file + timestamp).
-#
-# Usage:
-#   exporter = KASExporter(md, version=14, path_prefix="sources", path_dedup="suffix")
-#   print(exporter.generate_kas_configuration())
-
-from typing import Any, Dict, Union, Optional
 import copy
 import yaml
 import warnings
-
+from typing import Any, Dict, Union, Optional, Iterable
+from _repo_remote_layer_scanner import RemoteLayerScanner
+from _yaml_dumper import YamlDumper
 
 _DEFAULT_VERSION = 14
+
+# List of substrings to exclude from layers
+_LAYER_FILTER_SUBSTRS = [
+    "bitbake/lib/layerindexlib/tests/testdata",
+    "tests/"
+]
+
+# Allowed by spec
+_BUILD_SYSTEMS = {"openembedded", "oe", "isar"}
+
+
+def _discover_layers(url: str, refspec: str | None) -> list[str] | None:
+    """
+    Populate the minimal fields the exporter expects, discovering layers from REMOTE repos:
+      - bblayers_conf_header: {} (left empty)
+      - local_conf_header: {}  (left empty)
+      - distro, machine, target: left unset unless already present or provided via env
+      - repos[<key>]: ensure 'url', 'refspec', and infer 'layers' by scanning the remote
+    """
+
+    scanner = RemoteLayerScanner(url, refspec)
+    return scanner.scan()
 
 
 def _coerce_version(version: Union[int, str]) -> int:
@@ -39,13 +47,13 @@ def _coerce_version(version: Union[int, str]) -> int:
 
 class KASExporter:
     def __init__(
-        self,
-        manifest_data: Dict[str, Any],
-        version: Union[int, str] = _DEFAULT_VERSION,
-        *,
-        path_prefix: Optional[str] = None,
-        path_dedup: str = "off",  # "off" | "suffix"
-        path_apply_mode: str = "always"
+            self,
+            manifest_data: Dict[str, Any],
+            version: Union[int, str] = _DEFAULT_VERSION,
+            *,
+            path_prefix: Optional[str] = None,
+            path_dedup: str = "off",  # "off" | "suffix"
+            path_apply_mode: str = "always"
     ):
         self.manifest_data = copy.deepcopy(manifest_data)
         self.version = _coerce_version(version)
@@ -56,7 +64,7 @@ class KASExporter:
         if path_apply_mode not in {"always", "missing-only"}:
             raise ValueError("path_apply_mode must be 'always' or 'missing-only'")
         self.path_apply_mode = path_apply_mode
-        
+
         # Build remote->fetch map for URL resolution
         self._remote_fetch = {
             r["name"]: r.get("fetch", "") for r in self.manifest_data.get("remote", [])
@@ -65,22 +73,35 @@ class KASExporter:
     # ----------------------------- public API -----------------------------
 
     def generate_kas_configuration(self) -> str:
-        data = self._base_header()
+        # Build the kas configuration header
+        data = self._build_header()
 
-        # Optional top-level fields
+        # Build system
+        build_system = self._build_system(self.manifest_data.get("build_system"))
+        if build_system:
+            data["build_system"] = build_system
+
+        # Defaults
+        defaults = self._build_defaults()
+        if defaults:
+            data["defaults"] = defaults
+
+        # Machine
         if self.manifest_data.get("machine"):
             data["machine"] = self.manifest_data["machine"]
+
+        # Distro
         if self.manifest_data.get("distro"):
             data["distro"] = self.manifest_data["distro"]
-
-        # v3+: task
-        if self.version >= 3 and self.manifest_data.get("task"):
-            data["task"] = str(self.manifest_data["task"])
 
         # v4+: target can be list
         targets = self.manifest_data.get("targets")
         if targets:
             data["target"] = list(targets) if isinstance(targets, (list, tuple)) else [str(targets)]
+
+        # v3+: task
+        if self.version >= 3 and self.manifest_data.get("task"):
+            data["task"] = str(self.manifest_data["task"])
 
         # v6+: env
         if self.version >= 6:
@@ -111,15 +132,13 @@ class KASExporter:
             data["signers"] = self.manifest_data["signers"]
 
         # defaults / repos
-        defaults = self._build_defaults()
-        if defaults:
-            data["defaults"] = defaults
+
 
         repos = self._build_repos()
         if repos:
             data["repos"] = repos
 
-        yaml_text = yaml.safe_dump(data, sort_keys=False)
+        yaml_text = yaml.dump(data, Dumper=YamlDumper, default_flow_style=False, sort_keys=False)
 
         # Prepend source comment header
         header_comment = self._render_source_comment(self.manifest_data.get("__source"))
@@ -129,11 +148,79 @@ class KASExporter:
 
     # --------------------------- internal helpers -------------------------
 
+    def _build_header(self) -> Dict[str, Any]:
+        """
+        Build a spec-compliant header:
+          header:
+            version: <int>           # required
+            includes: [ ... ]        # optional; strings or {repo, file} dicts
+        """
+        header: Dict[str, Any] = {"version": int(self.version)}
+
+        raw_includes: Iterable[Any] = self.manifest_data.get("includes") or []
+        norm: list[Union[str, Dict[str, str]]] = []
+
+        seen: set = set()  # to keep order but avoid duplicates
+
+        def _add(item: Union[str, Dict[str, str]]) -> None:
+            key = item if isinstance(item, str) else ("dict", item.get("repo"), item.get("file"))
+            if key not in seen:
+                seen.add(key)
+                norm.append(item)
+
+        for it in raw_includes:
+            if not it:
+                continue
+
+            # Case 1: already a string path
+            if isinstance(it, str):
+                _add(it.strip())
+                continue
+
+            # Case 2: tuple/list like (repo, file)
+            if isinstance(it, (tuple, list)) and len(it) >= 2:
+                repo, file = str(it[0]).strip(), str(it[1]).strip()
+                if repo and file:
+                    _add({"repo": repo, "file": file})
+                continue
+
+            # Case 3: dict variants -> normalize to {"repo": ..., "file": ...} or string
+            if isinstance(it, dict):
+                repo = (it.get("repo") or it.get("repository") or it.get("repo_id"))
+                file = (it.get("file") or it.get("path") or it.get("kas"))
+                # If both present, emit dict form (cross-repo include)
+                if repo and file:
+                    _add({"repo": str(repo).strip(), "file": str(file).strip()})
+                    continue
+                # If only file present, treat as same-repo string include
+                if file and not repo:
+                    _add(str(file).strip())
+                    continue
+                # otherwise skip invalid include
+                continue
+
+            # Unknown type -> skip
+            continue
+
+        if norm:
+            header["includes"] = norm
+
+        return {"header": header}
+
+    @staticmethod
+    def _build_system(value: Optional[str], *, strict: bool = False) -> str | None:
+        if not value:
+            return None
+        v = value.strip().lower()
+        if v not in _BUILD_SYSTEMS:
+            if strict:
+                raise ValueError(f"build_system must be one of {_BUILD_SYSTEMS}, got {value!r}")
+            return None
+        return "openembedded" if v in {"oe", "openembedded"} else "isar"
+
     def _render_source_comment(self, src: Optional[Dict[str, Any]]) -> str:
-        lines = []
-        lines.append("# -----------------------------------------------------------------------------")
-        lines.append("# KAS Exporter Generated Configuration")
-        lines.append(f"#   kas format: v{self.version}")
+        lines = ["# -----------------------------------------------------------------------------",
+                 "# KAS Exporter Generated Configuration", f"#   kas format: v{self.version}"]
         if not src:
             lines.append("#   source: (unspecified)")
         else:
@@ -165,60 +252,64 @@ class KASExporter:
         lines.append("# -----------------------------------------------------------------------------")
         return "\n".join(lines)
 
-    def _base_header(self) -> Dict[str, Any]:
-        header: Dict[str, Any] = {"version": self.version}
-        includes = self.manifest_data.get("includes")
-        if includes:
-            header["includes"] = includes
-        return {"header": header}
+
 
     def _build_defaults(self) -> Dict[str, Any]:
-        defs = {}
+        """
+        Build 'defaults' that conform to the KAS spec:
+
+        defaults:
+          repos:
+            branch: <str>   # optional
+            tag:    <str>   # optional
+          patches:
+            repo:   <str>   # optional
+        """
+        defs: Dict[str, Any] = {}
+
         defaults_list = self.manifest_data.get("default", []) or []
         if not defaults_list:
             return defs
+
         d = defaults_list[0]
 
-        if d.get("remote") is not None:
-            defs["remote"] = d["remote"]
-
+        # Derive branch/tag from 'revision' when present, preserving your logic.
         rev = d.get("revision")
-        commit = None
         branch = d.get("branch")
         tag = d.get("tag")
-        refspec = None
 
         if rev:
             if rev.startswith("refs/tags/"):
                 tag = tag or rev.split("/", 2)[-1]
             elif rev.startswith("refs/heads/") or rev.startswith("origin/"):
                 branch = branch or rev.split("/", 2)[-1]
-            elif len(rev) in (40, 64) and all(c in "0123456789abcdef" for c in rev.lower()):
-                commit = rev
             else:
-                if self.version < 14:
-                    refspec = rev
-                else:
+                # Treat non-SHA rev as a branch name
+                _hex = "0123456789abcdef"
+                is_sha = len(rev) in (40, 64) and all(c in _hex for c in rev.lower())
+                if not is_sha:
                     branch = branch or rev
 
-        commit = d.get("commit", commit)
-        branch = d.get("branch", branch)
-        tag = d.get("tag", tag)
-        refspec = d.get("refspec", refspec)
+        # Build 'defaults.repos' per spec
+        repos_defaults: Dict[str, Any] = {}
+        if branch is not None:
+            repos_defaults["branch"] = branch
+        if tag is not None:
+            repos_defaults["tag"] = tag
+        if repos_defaults:
+            defs["repos"] = repos_defaults
 
-        if self.version >= 14:
-            if commit is not None:
-                defs["commit"] = commit
-            if branch is not None or (self.version >= 18 and "branch" in d):
-                defs["branch"] = branch
-            if self.version >= 16 and ("tag" in d or tag is not None):
-                defs["tag"] = tag
-        else:
-            if refspec is not None:
-                defs["refspec"] = refspec
+        # Build 'defaults.patches.repo' if provided by input
+        # Accept either nested 'patches: {repo: ...}' or a top-level alias 'patch_repo'
+        patch_repo = None
+        if isinstance(d.get("patches"), dict):
+            patch_repo = d["patches"].get("repo")
+        if patch_repo is None:
+            patch_repo = d.get("patch_repo")
 
-        if self.version >= 7 and d.get("type"):
-            defs["type"] = d["type"]
+        if patch_repo is not None:
+            defs["patches"] = {"repo": patch_repo}
+
         return defs
 
     def _build_repos(self) -> Dict[str, Any]:
@@ -233,6 +324,8 @@ class KASExporter:
             url = self._resolve_url(proj)
             if "url" in proj or url:
                 repo_entry["url"] = proj.get("url", url)
+
+            print(f"Scanning repo {repo_id}...")
 
             # PATH handling
             explicit_path = proj.get("path")
@@ -256,21 +349,27 @@ class KASExporter:
 
             # revisions (v14+ commit/branch/tag; earlier refspec)
             commit, branch, tag, refspec = self._derive_revision_fields(proj)
-
+            revision = None
             if self.version >= 14:
                 if commit is not None:
                     repo_entry["commit"] = commit
+                    revision = commit
                 if branch is not None or (self.version >= 18 and "branch" in proj):
                     repo_entry["branch"] = branch
+                    revision = branch
                 if self.version >= 15 and (tag is not None or (self.version >= 18 and "tag" in proj)):
                     repo_entry["tag"] = tag
+                    revision = tag
             else:
                 if refspec is not None:
                     repo_entry["refspec"] = refspec
+                    revision = refspec
 
             # layers
-            if proj.get("layers") is not None:
-                repo_entry["layers"] = self._normalize_layers(proj["layers"])
+            print("  Discovering layers...")
+            layers = _discover_layers(repo_entry["url"], revision)
+            if layers is not None:
+                repo_entry["layers"] = self._normalize_layers(layers)
 
             # v8: patches
             if self.version >= 8 and proj.get("patches"):
@@ -326,7 +425,8 @@ class KASExporter:
 
     # ------------------------------ utilities -----------------------------
 
-    def _repo_id(self, proj: Dict[str, Any]) -> str:
+    @staticmethod
+    def _repo_id(proj: Dict[str, Any]) -> str:
         if proj.get("id"):
             return proj["id"]
         if proj.get("name"):
@@ -369,14 +469,19 @@ class KASExporter:
         return commit, branch, tag, refspec
 
     @staticmethod
-    def _normalize_layers(layers: Any) -> Dict[str, Any]:
-        if isinstance(layers, dict):
-            return layers
-        if isinstance(layers, str):
-            return {layers: None}
-        if isinstance(layers, (list, tuple)):
-            return {str(x): None for x in layers}
-        return layers
+    def _normalize_layers(layers: Iterable[str]) -> Dict[str, Any]:
+        seen, out = set(), []
+        for layer in layers:
+            if not layer:
+                continue
+            if any(s in layer for s in _LAYER_FILTER_SUBSTRS):
+                continue
+            if layer in seen:
+                continue
+            seen.add(layer)
+            out.append(layer)
+        out.sort()
+        return {name: None for name in out}
 
     @staticmethod
     def _normalize_patches(patches: Any) -> Dict[str, Any]:
