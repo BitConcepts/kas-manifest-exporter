@@ -165,6 +165,7 @@ class KASExporter:
 
         self._detected_layers_by_repo: dict[str, list[str]] = {}
         self._matched_layer_tokens: set[str] = set()
+        self._layer_detection_failures: dict[str, str] = {}
 
         # Build remote->fetch map for URL resolution
         self._remote_fetch = {
@@ -472,13 +473,25 @@ class KASExporter:
 
             # layers
             print("  Discovering layers...")
-            layers = _discover_layers(repo_entry["url"], revision)
+            try:
+                layers = _discover_layers(repo_entry["url"], revision)
+            except Exception as exc:  # noqa: BLE001 - log repo context, continue
+                print(
+                    f"  Layer detection failed for {repo_id}: {exc}",
+                    file=sys.stderr,
+                )
+                self._layer_detection_failures[repo_id] = str(exc)
+                layers = None
             filtered_layers = self._filter_layer_list(layers or [])
             if filtered_layers:
                 self._detected_layers_by_repo[repo_id] = filtered_layers
                 selected_layers = self._select_layers_for_repo(repo_id, filtered_layers)
                 if selected_layers:
                     repo_entry["layers"] = self._normalize_layers(selected_layers)
+            elif self._layer_detection_failures.get(repo_id):
+                manual_layers = self._fallback_manual_layers(repo_id)
+                if manual_layers:
+                    repo_entry["layers"] = self._normalize_layers(manual_layers)
 
             # v8: patches
             if self.version >= 8 and proj.get("patches"):
@@ -504,6 +517,7 @@ class KASExporter:
     def _reset_layer_tracking(self) -> None:
         self._detected_layers_by_repo = {}
         self._matched_layer_tokens = set()
+        self._layer_detection_failures = {}
 
     def _select_layers_for_repo(self, repo_id: str, available_layers: list[str]) -> list[str]:
         if not available_layers:
@@ -532,6 +546,23 @@ class KASExporter:
                 selected.append(layer)
         return selected
 
+    def _fallback_manual_layers(self, repo_id: str) -> list[str]:
+        manual: list[str] = []
+        for (repo, layer), token in self._include_layers_by_repo.items():
+            if repo != repo_id:
+                continue
+            manual.append(layer)
+            self._matched_layer_tokens.add(token)
+        if manual:
+            warnings.warn(
+                (
+                    f"Layer detection unavailable for repo '{repo_id}'. "
+                    f"Trusting requested layers: {', '.join(manual)}"
+                ),
+                UserWarning,
+            )
+        return manual
+
     def _mark_matching_layer_requests(self, repo_id: str, available_layers: list[str]) -> None:
         if not self._requested_layer_tokens:
             return
@@ -552,11 +583,16 @@ class KASExporter:
             return
 
         available_lines: list[str] = []
-        if not self._detected_layers_by_repo:
+        repo_ids = set(self._detected_layers_by_repo)
+        repo_ids.update(self._layer_detection_failures)
+        if not repo_ids:
             available_lines.append("  (no layers detected)")
         else:
-            for repo_id in sorted(self._detected_layers_by_repo):
-                layers = ", ".join(self._detected_layers_by_repo[repo_id]) or "(none)"
+            for repo_id in sorted(repo_ids):
+                if repo_id in self._layer_detection_failures:
+                    layers = f"(detection failed: {self._layer_detection_failures[repo_id]})"
+                else:
+                    layers = ", ".join(self._detected_layers_by_repo[repo_id]) or "(none)"
                 available_lines.append(f"  {repo_id}: {layers}")
         available_msg = "\n".join(available_lines)
         raise ValueError(
