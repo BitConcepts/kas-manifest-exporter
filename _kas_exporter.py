@@ -1,7 +1,8 @@
 import copy
 import yaml
 import warnings
-from typing import Any, Dict, Union, Optional, Iterable
+from dataclasses import dataclass
+from typing import Any, Dict, Union, Optional, Iterable, Mapping, Sequence
 from _repo_remote_layer_scanner import RemoteLayerScanner
 from _yaml_dumper import YamlDumper
 
@@ -43,6 +44,20 @@ def _coerce_version(version: Union[int, str]) -> int:
             except ValueError:
                 v = int(s)
     return max(1, min(20, v))
+
+
+@dataclass(frozen=True)
+class _LayerPattern:
+    repo: Optional[str]
+    name: str
+
+    def matches(self, repo_id: str, layer: str) -> bool:
+        if self.repo and self.repo != repo_id:
+            return False
+        if self.name == layer:
+            return True
+        # Allow matching by basename for convenience
+        return self.name == layer.rstrip("/").split("/")[-1]
 
 
 class KASExporter:
@@ -574,13 +589,21 @@ class KASExporter:
         seen, out = set(), []
         for layer in layers:
             if not layer:
-                continue
+                return
             if any(s in layer for s in _LAYER_FILTER_SUBSTRS):
-                continue
+                return
+            if not self._layer_allowed(repo_id, layer):
+                return
             if layer in seen:
-                continue
+                return
             seen.add(layer)
             out.append(layer)
+
+        for layer in (discovered_layers or []):
+            _consider(layer)
+        for layer in (hints or []):
+            _consider(layer)
+
         out.sort()
         return out
 
