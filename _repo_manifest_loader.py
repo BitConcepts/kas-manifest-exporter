@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import pygit2 as git
 from pygit2.enums import ResetMode, CheckoutStrategy
-from pygit2 import Repository, Commit
+from pygit2 import Repository, Commit, RemoteCallbacks, UserPass
 from _repo_manifest_parser import RepoManifestParser
 
 
@@ -66,7 +66,65 @@ def _discover_default_branch(repo: Repository) -> Optional[str]:
     return None
 
 
-def _checkout_branch(repo: Repository, branch_name: str) -> None:
+def _build_remote_callbacks(repo_url: str) -> Optional[RemoteCallbacks]:
+    """
+    Build RemoteCallbacks for authenticated fetch/clone to avoid anonymous rate limiting.
+
+    Env vars used (first non-empty wins):
+      - GIT_ASKPASS     : treated as the password/token string
+      - GIT_PASSWORD    : password/token string
+      - GITHUB_TOKEN    : GitHub PAT
+      - GIT_USERNAME    : username (optional; fallback depends on URL)
+    """
+    # Order of preference for secrets
+    token = (
+            os.environ.get("GIT_ASKPASS")
+            or os.environ.get("GIT_PASSWORD")
+            or os.environ.get("GITHUB_TOKEN")
+    )
+
+    if not token:
+        # No credentials configured; fall back to anonymous clone.
+        return None
+
+    # Username: explicit env override → username from URL → sensible default
+    default_username = "git"
+    if "github.com" in (repo_url or ""):
+        # GitHub over HTTPS accepts any username when using a PAT; "git" is fine.
+        default_username = "git"
+
+    env_username = os.environ.get("GIT_USERNAME")
+
+    # username_from_url will be provided by libgit2 when calling the callback
+
+    def cred_cb(url: str, username_from_url: str, allowed_types: int):
+        username = env_username or username_from_url or default_username
+
+        # Try to respect allowed_types if we can
+        try:
+            # Newer pygit2 exposes CredentialType in enums, older via credentials.*
+            cred_mod = getattr(git, "credentials", None)
+            credtype_plain = None
+            if cred_mod is not None and hasattr(cred_mod, "GIT_CREDTYPE_USERPASS_PLAINTEXT"):
+                credtype_plain = cred_mod.GIT_CREDTYPE_USERPASS_PLAINTEXT
+
+            if credtype_plain is None or (allowed_types & credtype_plain):
+                return UserPass(username, token)
+        except Exception:
+            # Fallback: just try username/password
+            return UserPass(username, token)
+
+        # If we got here and didn't return, still try UserPass as a last resort
+        return UserPass(username, token)
+
+    return RemoteCallbacks(credentials=cred_cb)
+
+
+def _checkout_branch(
+        repo: Repository,
+        branch_name: str,
+        callbacks: Optional[RemoteCallbacks] = None,
+) -> None:
     """
     Ensure a local branch exists for 'branch_name' from origin/<branch_name>,
     set HEAD to it, reset the working tree, and checkout files.
@@ -75,7 +133,12 @@ def _checkout_branch(repo: Repository, branch_name: str) -> None:
         origin = repo.remotes["origin"]
     except KeyError:
         raise LibGitError("Remote 'origin' not found in repository")
-    origin.fetch([f"refs/heads/{branch_name}:refs/remotes/origin/{branch_name}"])
+
+    fetch_kwargs: Dict[str, Any] = {}
+    if callbacks is not None:
+        fetch_kwargs["callbacks"] = callbacks
+
+    origin.fetch([f"refs/heads/{branch_name}:refs/remotes/origin/{branch_name}"], **fetch_kwargs)
 
     local_ref_name = f"refs/heads/{branch_name}"
 
@@ -135,6 +198,12 @@ def load_manifest_from_git(
     """
     Clone 'repo_url' using libgit2 and parse the chosen manifest.
 
+    Auth / rate limiting:
+      - If GIT_ASKPASS / GIT_PASSWORD / GITHUB_TOKEN is set, authenticated HTTPS
+        is used via libgit2 RemoteCallbacks, which avoids anonymous API limits
+        (e.g. on GitHub).
+      - Optional GIT_USERNAME can override the username used for HTTPS auth.
+
     Args:
       repo_url: HTTPS/SSH URL for the repo.
       branch:   Optional branch/ref name. If None, uses repo's default branch.
@@ -152,23 +221,28 @@ def load_manifest_from_git(
     created_parent = workdir is None
     clone_dir = os.path.join(parent_dir, "repo")
 
+    callbacks = _build_remote_callbacks(repo_url)
+
     try:
         # Clone without specifying checkout_branch so we land on provider's default branch.
         # If 'branch' is provided, we’ll check it out explicitly after cloning.
-        repo = git.clone_repository(repo_url, clone_dir)
+        if callbacks is not None:
+            repo = git.clone_repository(repo_url, clone_dir, callbacks=callbacks)
+        else:
+            repo = git.clone_repository(repo_url, clone_dir)
 
         # Decide which branch to use
         active_branch = branch or _discover_default_branch(repo)  # may still be None (detached or unborn)
         if branch:
             # User specified branch: checkout it
-            _checkout_branch(repo, branch)
+            _checkout_branch(repo, branch, callbacks=callbacks)
             active_branch = branch
         else:
             # If we didn't learn an active branch (detached HEAD), try to make one from origin/HEAD.
             if not active_branch:
                 default_branch = _discover_default_branch(repo)
                 if default_branch:
-                    _checkout_branch(repo, default_branch)
+                    _checkout_branch(repo, default_branch, callbacks=callbacks)
                     active_branch = default_branch
                 else:
                     # Leave as-is; we'll still read files from current tree
