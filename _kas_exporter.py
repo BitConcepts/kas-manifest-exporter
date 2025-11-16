@@ -53,7 +53,9 @@ class KASExporter:
             *,
             path_prefix: Optional[str] = None,
             path_dedup: str = "off",  # "off" | "suffix"
-            path_apply_mode: str = "always"
+            path_apply_mode: str = "always",
+            include_layers: Optional[Iterable[str]] = None,
+            include_all_layers: bool = False,
     ):
         self.manifest_data = copy.deepcopy(manifest_data)
         self.version = _coerce_version(version)
@@ -64,6 +66,34 @@ class KASExporter:
         if path_apply_mode not in {"always", "missing-only"}:
             raise ValueError("path_apply_mode must be 'always' or 'missing-only'")
         self.path_apply_mode = path_apply_mode
+        self.include_all_layers = bool(include_all_layers)
+
+        include_layers = include_layers or []
+        self._requested_layer_tokens: set[str] = set()
+        self._include_layers_by_repo: dict[tuple[str, str], str] = {}
+        self._include_layers_any_repo: dict[str, str] = {}
+        for entry in include_layers:
+            raw = str(entry).strip()
+            if not raw:
+                continue
+            if ":" in raw:
+                repo, layer = raw.split(":", 1)
+                repo = repo.strip()
+                layer = layer.strip()
+                if not repo or not layer:
+                    raise ValueError(
+                        "include_layer entries must be 'repo:layer' or 'layer'"
+                    )
+                token = f"{repo}:{layer}"
+                self._requested_layer_tokens.add(token)
+                self._include_layers_by_repo[(repo, layer)] = token
+            else:
+                token = raw
+                self._requested_layer_tokens.add(token)
+                self._include_layers_any_repo[token] = token
+
+        self._detected_layers_by_repo: dict[str, list[str]] = {}
+        self._matched_layer_tokens: set[str] = set()
 
         # Build remote->fetch map for URL resolution
         self._remote_fetch = {
@@ -73,6 +103,8 @@ class KASExporter:
     # ----------------------------- public API -----------------------------
 
     def generate_kas_configuration(self) -> str:
+        self._reset_layer_tracking()
+
         # Build the kas configuration header
         data = self._build_header()
 
@@ -137,6 +169,8 @@ class KASExporter:
         repos = self._build_repos()
         if repos:
             data["repos"] = repos
+
+        self._validate_layer_requests()
 
         yaml_text = yaml.dump(data, Dumper=YamlDumper, default_flow_style=False, sort_keys=False)
 
@@ -368,8 +402,12 @@ class KASExporter:
             # layers
             print("  Discovering layers...")
             layers = _discover_layers(repo_entry["url"], revision)
-            if layers is not None:
-                repo_entry["layers"] = self._normalize_layers(layers)
+            filtered_layers = self._filter_layer_list(layers or [])
+            if filtered_layers:
+                self._detected_layers_by_repo[repo_id] = filtered_layers
+                selected_layers = self._select_layers_for_repo(repo_id, filtered_layers)
+                if selected_layers:
+                    repo_entry["layers"] = self._normalize_layers(selected_layers)
 
             # v8: patches
             if self.version >= 8 and proj.get("patches"):
@@ -391,6 +429,69 @@ class KASExporter:
             repos[repo_id] = repo_entry
 
         return repos
+
+    def _reset_layer_tracking(self) -> None:
+        self._detected_layers_by_repo = {}
+        self._matched_layer_tokens = set()
+
+    def _select_layers_for_repo(self, repo_id: str, available_layers: list[str]) -> list[str]:
+        if not available_layers:
+            return []
+
+        if self.include_all_layers:
+            self._mark_matching_layer_requests(repo_id, available_layers)
+            return available_layers
+
+        if not self._requested_layer_tokens:
+            return []
+
+        selected: list[str] = []
+        for layer in available_layers:
+            matched = False
+            repo_key = (repo_id, layer)
+            token = self._include_layers_by_repo.get(repo_key)
+            if token:
+                self._matched_layer_tokens.add(token)
+                matched = True
+            token = self._include_layers_any_repo.get(layer)
+            if token:
+                self._matched_layer_tokens.add(token)
+                matched = True
+            if matched:
+                selected.append(layer)
+        return selected
+
+    def _mark_matching_layer_requests(self, repo_id: str, available_layers: list[str]) -> None:
+        if not self._requested_layer_tokens:
+            return
+        for layer in available_layers:
+            repo_key = (repo_id, layer)
+            token = self._include_layers_by_repo.get(repo_key)
+            if token:
+                self._matched_layer_tokens.add(token)
+            token = self._include_layers_any_repo.get(layer)
+            if token:
+                self._matched_layer_tokens.add(token)
+
+    def _validate_layer_requests(self) -> None:
+        if not self._requested_layer_tokens:
+            return
+        missing = sorted(self._requested_layer_tokens - self._matched_layer_tokens)
+        if not missing:
+            return
+
+        available_lines: list[str] = []
+        if not self._detected_layers_by_repo:
+            available_lines.append("  (no layers detected)")
+        else:
+            for repo_id in sorted(self._detected_layers_by_repo):
+                layers = ", ".join(self._detected_layers_by_repo[repo_id]) or "(none)"
+                available_lines.append(f"  {repo_id}: {layers}")
+        available_msg = "\n".join(available_lines)
+        raise ValueError(
+            "Requested layers were not found: " + ", ".join(missing) +
+            "\nAvailable layers:\n" + available_msg
+        )
 
     # ------------- path de-dup / conflict handling -------------
 
@@ -469,7 +570,7 @@ class KASExporter:
         return commit, branch, tag, refspec
 
     @staticmethod
-    def _normalize_layers(layers: Iterable[str]) -> Dict[str, Any]:
+    def _filter_layer_list(layers: Iterable[str]) -> list[str]:
         seen, out = set(), []
         for layer in layers:
             if not layer:
@@ -481,7 +582,12 @@ class KASExporter:
             seen.add(layer)
             out.append(layer)
         out.sort()
-        return {name: None for name in out}
+        return out
+
+    @classmethod
+    def _normalize_layers(cls, layers: Iterable[str]) -> Dict[str, Any]:
+        filtered = cls._filter_layer_list(layers)
+        return {name: None for name in filtered}
 
     @staticmethod
     def _normalize_patches(patches: Any) -> Dict[str, Any]:
