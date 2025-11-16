@@ -1,4 +1,8 @@
 import copy
+import os
+import shutil
+import sys
+import tempfile
 import yaml
 import warnings
 from typing import Any, Dict, Union, Optional, Iterable
@@ -27,7 +31,74 @@ def _discover_layers(url: str, refspec: str | None) -> list[str] | None:
     """
 
     scanner = RemoteLayerScanner(url, refspec)
-    return scanner.scan()
+    try:
+        return scanner.scan()
+    except Exception as exc:  # noqa: BLE001 - surface message via CLI
+        fallback = _discover_layers_via_clone(url, refspec, exc)
+        if fallback is not None:
+            return fallback
+        raise
+
+
+def _discover_layers_via_clone(url: str, refspec: str | None, original_exc: Exception) -> list[str] | None:
+    """Fallback: clone the repo locally (pygit2) and scan the checkout for layers."""
+    try:
+        import pygit2  # type: ignore
+    except ImportError:
+        print(
+            f"  Layer discovery failed for {url}: {original_exc} (pygit2 unavailable)",
+            file=sys.stderr,
+        )
+        return None
+
+    tmp_root = tempfile.mkdtemp(prefix="kas-layer-scan-")
+    repo_path = os.path.join(tmp_root, "repo")
+
+    print(
+        f"  Layer discovery failed for {url}: {original_exc}. "
+        "Falling back to a temporary clone...",
+        file=sys.stderr,
+    )
+
+    try:
+        repo = pygit2.clone_repository(url, repo_path)
+        _checkout_clone_to_ref(repo, refspec, pygit2)
+        local_scanner = RemoteLayerScanner(repo_path, refspec)
+        layers = local_scanner.scan()
+        if layers:
+            print("  Local fallback detected layers successfully.", file=sys.stderr)
+        else:
+            print("  Local fallback completed but found no layers.", file=sys.stderr)
+        return layers
+    except Exception as clone_exc:  # noqa: BLE001 - prefer original exception
+        print(f"  Local fallback failed: {clone_exc}", file=sys.stderr)
+        return None
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def _checkout_clone_to_ref(repo, refspec: str | None, pygit2_mod) -> None:
+    if not refspec:
+        return
+
+    try:
+        obj = repo.revparse_single(refspec)
+    except Exception:  # noqa: BLE001 - best effort checkout
+        return
+
+    if isinstance(obj, pygit2_mod.Tag):
+        target = repo.get(obj.target)
+        if isinstance(target, pygit2_mod.Commit):
+            obj = target
+        else:
+            return
+
+    if isinstance(obj, pygit2_mod.Commit):
+        repo.checkout_tree(obj.tree)
+        if hasattr(repo, "set_head_detached"):
+            repo.set_head_detached(obj.id)
+        else:  # pragma: no cover - older pygit2
+            repo.set_head(obj.id)
 
 
 def _coerce_version(version: Union[int, str]) -> int:
